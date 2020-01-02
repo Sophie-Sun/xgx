@@ -23,9 +23,11 @@ Rmarkdown template to generate this page can be found on [Rmarkdown-Template](Rm
 # library(rmarkdown)
 library(ggplot2)
 library(dplyr)
+library(broom)
+library(knitr)
 library(survival)
 library(survminer)
-library(xgxr)
+library(xgxr,lib.loc = "../Rlib")
 ```
 
 # Explore Exposure-Response Relationship
@@ -38,33 +40,99 @@ Time-to-event plots can be summarized by Kaplan-Meier plots and stratified by ex
 
 #Use the lung dataset to create a fake exposure dataset
 km_data <- lung %>%
-  mutate(fake_exposure = ph.ecog + age/50) %>%
-  filter(!is.na(fake_exposure)) %>%
-  mutate(exposure_quartile= cut(fake_exposure,
-                             breaks=quantile(fake_exposure,c(0,.25,.5,.75,1)),
-                             include.lowest=TRUE,
-                             labels=paste0("Q",c(4,3,2,1))))
+  mutate(fake_Cmax = ph.ecog + age/50) %>%
+  filter(!is.na(fake_Cmax)) %>%
+  mutate(Cmax_quartile= cut(fake_Cmax,
+                            breaks=quantile(fake_Cmax,c(0,.25,.5,.75,1)),
+                            include.lowest=TRUE,
+                            labels=paste0("Q",c(4,3,2,1))))
 
 #these columns are required for your dataset
 km_data <- km_data %>%
-  mutate(exposure = exposure_quartile, #exposure quantile,
+  mutate(exposure = Cmax_quartile, #exposure quantile,
          time   = time,   #time of the event (or censoring)
          event  = status) #status: there are a three options for this column (see ?Surv)
-                          #        a) 0 = censored (alive), 1 = dead (event)
-                          #        b) 1 = censored (alive), 2 = dead (event)
-                          #        c) 0 = right censored, 1 = event at time, 
-                          #           2 = left censored,  3 = interval censored.
+#        a) 0 = censored (alive), 1 = dead (event)
+#        b) 1 = censored (alive), 2 = dead (event)
+#        c) 0 = right censored, 1 = event at time, 
+#           2 = left censored,  3 = interval censored.
 ```
 
-## Plot Kaplan Meier with Confidence Intervals
+## Plot Kaplan Meier with Confidence Intervals using only Cmax
 ```{r warning=FALSE, message=FALSE}
 km_fit <- survfit(Surv(time) ~ exposure, data = km_data, conf.int = 0.95)
 gg <- ggsurvplot(km_fit, km_data, conf.int = TRUE, ggtheme = xgx_theme())
 gg <- gg + xgx_scale_x_time_units(units_dataset = "day", units_plot = "year")
 print(gg)
 ```
-  
 
+
+## Plot Kaplan Meier with facetting. Also using a CENS column instead of the more granular event/status as shown before.
+In this example, the exposures are also calculated using the measurements in two units (as depicted in OBSID). Another parameter for facetting used here is whether the quartile characterization was performed on AUC or Cmax
+
+```{r warning=FALSE, message=FALSE}
+AssignGroup = function(Parameter)
+{
+  group = case_when(Parameter < quantile(Parameter,0.25,na.rm = TRUE) ~ "Q1",
+                    Parameter >= quantile(Parameter,0.25,na.rm = TRUE) & Parameter < quantile(Parameter,0.5,na.rm = TRUE) ~ "Q2",
+                    Parameter >= quantile(Parameter,0.5,na.rm = TRUE) & Parameter < quantile(Parameter,0.75,na.rm = TRUE) ~ "Q3",
+                    Parameter >= quantile(Parameter,0.75,na.rm = TRUE) ~"Q4")
+}
+
+km_data_facet_raw <- lung %>%
+  mutate(fake_Cmax = ph.ecog + age/50,
+         fake_AUC = ph.ecog*ph.karno + (age/50)^sex) %>%
+  filter(!is.na(fake_Cmax) | !is.na(fake_AUC)) %>%
+  mutate(timeCENS = sample(c(0,1), replace=TRUE, size=dim(km_data)[1]),  # randomly assigning  CENS for time to event as 0 or 1. In real data, this will be defined
+         Cmax_quartile= AssignGroup(fake_Cmax),
+         AUC_quartile = AssignGroup(fake_AUC)) %>%
+  mutate(OBSID = "Raw Data")
+
+km_data_facet_relative <- lung %>%
+  mutate(fake_Cmax = 100*ph.ecog + age/50,
+         fake_AUC = 100*ph.ecog*ph.karno + (age/50)^sex) %>%
+  filter(!is.na(fake_Cmax) | !is.na(fake_AUC)) %>%
+  mutate (timeCENS = sample(c(0,1), replace=TRUE, size=dim(km_data)[1]),  # randomly assigning  CENS for time to event as 0 or 1. In real data, this will be defined
+          Cmax_quartile= AssignGroup(fake_Cmax),
+          AUC_quartile = AssignGroup(fake_AUC)) %>%
+  mutate(OBSID = "Relative Data")
+
+km_data_facet = rbind(km_data_facet_raw,km_data_facet_relative) %>% # binding the two types of data - raw, relative units
+       select(-fake_AUC,-fake_Cmax) %>%
+  tidyr::gather(PKname, PKvalue, Cmax_quartile:AUC_quartile) 
+
+km_fit_facet <- survfit(Surv(time, event = (timeCENS ==0)) ~ PKvalue, data = km_data_facet, conf.int = 0.95)
+gg_facet <- ggsurvplot(km_fit_facet, km_data_facet, facet.by = c("PKname","OBSID"), conf.int = TRUE, ggtheme = xgx_theme())
+gg_facet <- gg_facet + xgx_scale_x_time_units(units_dataset = "day", units_plot = "year")
+print(gg_facet)
+```
+
+## Performing Cox regression on the above data. 
+In this data only 2 variables are available, so variable selection isn't needed. If there are multiple variables, applying a variable selection approach (e.g. stepwiseAIC) would be advisable. The hazard ratio here corresponds to a 20% increase in the PK metric (Cmax, AUC)
+
+```{r warning=FALSE, message=FALSE}
+km_Cox_raw = coxph(Surv(time, event = (timeCENS == 0)) ~ 
+                        fake_AUC + fake_Cmax,
+                      data =km_data_facet_raw)
+
+km_Cox_rawSummary = broom::tidy(km_Cox_raw) %>%
+  mutate(OBSID = "Raw data")
+
+km_Cox_relative = coxph(Surv(time, event = (timeCENS == 0)) ~ 
+                        fake_AUC + fake_Cmax,
+                      data =km_data_facet_relative)
+
+km_Cox_relativeSummary = broom::tidy(km_Cox_relative) %>%
+  mutate(OBSID = "Relative data")
+
+allCoxSummaries = rbind(km_Cox_rawSummary,km_Cox_relativeSummary) %>%
+  mutate(HR = (1.2)^estimate,
+         HR.low = 1.2^conf.low,
+         HR.high = 1.2^conf.high) 
+
+kable(allCoxSummaries)  
+
+```
 
 ## R Session Info
 ```{r}
